@@ -33,6 +33,7 @@
  */
 
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <cstdlib>
 #include <cstdio>
@@ -52,7 +53,8 @@
  * #include <librdkafka/rdkafkacpp.h>
  */
 #include "rdkafkacpp.h"
-
+#include <librdkafka/rdkafka.h>
+#include "../src/rdposix.h"
 
 static void metadata_print (const std::string &topic,
                             const RdKafka::Metadata *metadata) {
@@ -263,13 +265,94 @@ class ExampleConsumeCb : public RdKafka::ConsumeCb {
 };
 
 
+/*MYSEO created*/
+const char *test_getenv (const char *env, const char *def) {
+        return rd_getenv(env, def);
+}
+/**
+ * @brief Get path to test config file
+ */
+const char *conf_get_path (void) {
+        return test_getenv("RDKAFKA_TEST_CONF", "test.conf");
+}
+
+/**
+ * @brief Read config file and populate config objects.
+ * @returns 0 on success or -1 on error
+ */
+static int read_config_file (std::string path,
+                             RdKafka::Conf *conf,
+                             RdKafka::Conf *topic_conf,
+                             int *timeoutp) {
+  std::ifstream input(path.c_str(), std::ifstream::in);
+
+  if (!input)
+    return 0;
+
+  std::string line;
+  while (std::getline(input, line)) {
+    /* Trim string */
+    line.erase(0, line.find_first_not_of("\t "));
+    line.erase(line.find_last_not_of("\t ") + 1);
+
+    if (line.length() == 0 ||
+        line.substr(0, 1) == "#")
+      continue;
+
+    size_t f = line.find("=");
+    if (f == std::string::npos) {
+      std::cerr << "Conf file: malformed line: " << std::endl;
+      return -1;
+    }
+
+    std::string n = line.substr(0, f);
+    std::string v = line.substr(f+1);
+    std::string errstr;
+
+    RdKafka::Conf::ConfResult r = RdKafka::Conf::CONF_UNKNOWN;
+
+    if (n.substr(0, 6) == "topic.")
+      r = topic_conf->set(n.substr(6), v, errstr);
+    if (r == RdKafka::Conf::CONF_UNKNOWN)
+      r = conf->set(n, v, errstr);
+
+    if (r != RdKafka::Conf::CONF_OK) {
+      std::cerr << errstr << std::endl;
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+void conf_init (RdKafka::Conf **conf,
+                RdKafka::Conf **topic_conf,
+                int timeout) {
+  if (conf)
+    *conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
+  if (topic_conf)
+    *topic_conf = RdKafka::Conf::create(RdKafka::Conf::CONF_TOPIC);
+
+  read_config_file(conf_get_path(),
+                   conf ? *conf : NULL,
+                   topic_conf ? *topic_conf : NULL, &timeout);
+
+  char hostname[128];
+  gethostname(hostname, sizeof(hostname)-1);
+  std::string errstr;
+  if ((*conf)->set("client.id", std::string("qucell@") + hostname, errstr) !=
+      RdKafka::Conf::CONF_OK)
+    std::cerr << errstr << std::endl;
+
+}
 
 int main (int argc, char **argv) {
-  std::string brokers = "localhost";
+  std::string brokers;
   std::string errstr;
   std::string topic_str;
   std::string mode;
   std::string debug;
+  std::string p_key;
   int32_t partition = RdKafka::Topic::PARTITION_UA;
   int64_t start_offset = RdKafka::Topic::OFFSET_BEGINNING;
   bool do_conf_dump = false;
@@ -280,11 +363,13 @@ int main (int argc, char **argv) {
   /*
    * Create configuration objects
    */
-  RdKafka::Conf *conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
-  RdKafka::Conf *tconf = RdKafka::Conf::create(RdKafka::Conf::CONF_TOPIC);
+  // RdKafka::Conf *conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
+  RdKafka::Conf *conf;
+  RdKafka::Conf *tconf;
+  conf_init(&conf, &tconf, 0);
+  // RdKafka::Conf *tconf = RdKafka::Conf::create(RdKafka::Conf::CONF_TOPIC);
 
-
-  while ((opt = getopt(argc, argv, "PCLt:p:b:z:qd:o:eX:AM:f:")) != -1) {
+  while ((opt = getopt(argc, argv, "PCLt:p:k:b:z:qd:o:eX:AM:f")) != -1) {
     switch (opt) {
     case 'P':
     case 'C':
@@ -306,14 +391,17 @@ int main (int argc, char **argv) {
       } else
         partition = std::atoi(optarg);
       break;
+    case 'k':
+      p_key = optarg;
+      break;
     case 'b':
       brokers = optarg;
       break;
     case 'z':
       if (conf->set("compression.codec", optarg, errstr) !=
-	  RdKafka::Conf::CONF_OK) {
-	std::cerr << errstr << std::endl;
-	exit(1);
+	      RdKafka::Conf::CONF_OK) {
+        std::cerr << errstr << std::endl;
+        exit(1);
       }
       break;
     case 'o':
@@ -340,38 +428,44 @@ int main (int argc, char **argv) {
       }
       break;
     case 'X':
-      {
-	char *name, *val;
+    {
+      char *name, *val;
 
-	if (!strcmp(optarg, "dump")) {
-	  do_conf_dump = true;
-	  continue;
-	}
+      if (!strcmp(optarg, "list") ||
+			    !strcmp(optarg, "help")) {
+				rd_kafka_conf_properties_show(stdout);
+				exit(0);
+			}
 
-	name = optarg;
-	if (!(val = strchr(name, '='))) {
-          std::cerr << "%% Expected -X property=value, not " <<
-              name << std::endl;
-	  exit(1);
-	}
+      // if (!strcmp(optarg, "dump")) {
+      //   do_conf_dump = true;
+      //   continue;
+      // }
 
-	*val = '\0';
-	val++;
-
-	/* Try "topic." prefixed properties on topic
-	 * conf first, and then fall through to global if
-	 * it didnt match a topic configuration property. */
-        RdKafka::Conf::ConfResult res;
-	if (!strncmp(name, "topic.", strlen("topic.")))
-          res = tconf->set(name+strlen("topic."), val, errstr);
-        else
-	  res = conf->set(name, val, errstr);
-
-	if (res != RdKafka::Conf::CONF_OK) {
-          std::cerr << errstr << std::endl;
-	  exit(1);
-	}
+      name = optarg;
+      if (!(val = strchr(name, '='))) {
+              std::cerr << "%% Expected -X property=value, not " <<
+                  name << std::endl;
+        exit(1);
       }
+
+      *val = '\0';
+      val++;
+
+      /* Try "topic." prefixed properties on topic
+      * conf first, and then fall through to global if
+      * it didnt match a topic configuration property. */
+      RdKafka::Conf::ConfResult res;
+      if (!strncmp(name, "topic.", strlen("topic.")))
+        res = tconf->set(name+strlen("topic."), val, errstr);
+      else
+        res = conf->set(name, val, errstr);
+
+      if (res != RdKafka::Conf::CONF_OK) {
+        std::cerr << errstr << std::endl;
+        exit(1);
+      }
+    }
       break;
 
       case 'f':
@@ -388,12 +482,42 @@ int main (int argc, char **argv) {
     }
   }
 
+  // /*MYSEO created*/
+	// if (do_conf_dump) {
+	// 	const char **arr;
+	// 	size_t cnt;
+	// 	int pass;
+
+	// 	for (pass = 0 ; pass < 2 ; pass++) {
+	// 		int i;
+
+	// 		if (pass == 0) {
+	// 			arr = rd_kafka_conf_dump(conf->c_ptr_global(), &cnt);
+	// 			printf("# Global config\n");
+	// 		} else {
+	// 			printf("# Topic config\n");
+	// 			arr = rd_kafka_topic_conf_dump(tconf->c_ptr_topic(),
+	// 						       &cnt);
+	// 		}
+
+	// 		for (i = 0 ; i < (int)cnt ; i += 2)
+	// 			printf("%s = %s\n",
+	// 			       arr[i], arr[i+1]);
+
+	// 		printf("\n");
+
+	// 		rd_kafka_conf_dump_free(arr, cnt);
+	// 	}
+
+	// 	exit(0);
+	// }
+
   if (mode.empty() || (topic_str.empty() && mode != "L") || optind != argc) {
   usage:
 	  std::string features;
 	  conf->get("builtin.features", features);
     fprintf(stderr,
-            "Usage: %s [-C|-P] -t <topic> "
+            "Usage: %s [-C|-P|-L] -t <topic> "
             "[-p <partition>] [-b <host1:port1,host2:port2,..>]\n"
             "\n"
             "librdkafka version %s (0x%08x, builtin.features \"%s\")\n"
@@ -418,15 +542,22 @@ int main (int argc, char **argv) {
             "configuration property\n"
             "                  Properties prefixed with \"topic.\" "
             "will be set on topic object.\n"
-            "                  Use '-X list' to see the full list\n"
-            "                  of supported properties.\n"
+            // "                  Use '-X dump' to see the full list\n"
+            // "                  of supported properties.\n"
+            "  -X list         Show full list of supported "
+			      "properties.\n"
+            // "  -X dump         Show configuration\n"
             "  -f <flag>       Set option:\n"
             "                     ccb - use consume_callback\n"
+            "  -k <key>        Message Key\n"
             "\n"
             " In Consumer mode:\n"
             "  writes fetched messages to stdout\n"
             " In Producer mode:\n"
             "  reads messages from stdin and sends to broker\n"
+            " In List mode:\n"
+            "  queries broker for metadata information, "
+            "topic is optional.\n"
             "\n"
             "\n"
             "\n",
@@ -531,7 +662,7 @@ int main (int argc, char **argv) {
                           /* Value */
                           const_cast<char *>(line.c_str()), line.size(),
                           /* Key */
-                          NULL, 0,
+                          const_cast<char *>(p_key.c_str()), p_key.size(),
                           /* Timestamp (defaults to now) */
                           0,
                           /* Message headers, if any */

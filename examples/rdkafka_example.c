@@ -304,6 +304,9 @@ int main (int argc, char **argv) {
         rd_kafka_headers_t *hdrs = NULL;
         rd_kafka_resp_err_t err;
 
+	char buf[512];
+	int line =0;
+
 	/* Kafka configuration */
 	conf = rd_kafka_conf_new();
 
